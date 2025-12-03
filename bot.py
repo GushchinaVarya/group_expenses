@@ -7,8 +7,13 @@ import os
 import csv
 import json
 import logging
+import io
 from datetime import datetime
 from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -47,6 +52,7 @@ WAITING_FOR_CATEGORIES = 0
 SELECTING_CATEGORY = 1
 ENTERING_PRICE = 2
 ENTERING_COMMENT = 3
+SELECTING_PERIOD = 4
 
 
 def get_categories_file(chat_id: int) -> Path:
@@ -87,6 +93,53 @@ def save_expense(chat_id: int, user: str, category: str, price: float, comment: 
         
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         writer.writerow([date, user, category, price, comment])
+
+
+def get_stat_for_period(csv_file: str | Path, start: str, end: str) -> dict:
+    """
+    Get statistics for expenses in a given period.
+    
+    Args:
+        csv_file: Path to CSV file with columns Date,User,Category,Price,Comment
+        start: Start date in format YYYY-MM-DD
+        end: End date in format YYYY-MM-DD
+    
+    Returns:
+        Dictionary with:
+        - total: Total spend for the period
+        - by_category: Dict of category -> spend
+        - by_user: Dict of user -> spend
+    """
+    start_date = datetime.strptime(start, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    
+    total = 0.0
+    by_category = {}
+    by_user = {}
+    
+    with open(csv_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Parse date (only date part, ignore time)
+            date_str = row["Date"].split()[0]
+            row_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            
+            # Check if within period
+            if start_date <= row_date <= end_date:
+                price = float(row["Price"])
+                category = row["Category"]
+                user = row["User"]
+                
+                # Update totals
+                total += price
+                by_category[category] = by_category.get(category, 0.0) + price
+                by_user[user] = by_user.get(user, 0.0) + price
+    
+    return {
+        "total": total,
+        "by_category": by_category,
+        "by_user": by_user,
+    }
 
 
 def get_periods(csv_file: str | Path) -> list[tuple[str, str, str]]:
@@ -141,6 +194,186 @@ def get_periods(csv_file: str | Path) -> list[tuple[str, str, str]]:
     result.append(("All period", earliest.strftime("%Y-%m-%d"), latest.strftime("%Y-%m-%d")))
     
     return result
+
+
+def generate_pie_chart(by_category: dict) -> io.BytesIO:
+    """
+    Generate a pie chart of spendings by categories.
+    
+    Args:
+        by_category: Dict of category -> spend amount
+    
+    Returns:
+        BytesIO buffer containing the PNG image
+    """
+    if not by_category:
+        return None
+    
+    # Prepare data
+    categories = list(by_category.keys())
+    amounts = list(by_category.values())
+    total = sum(amounts)
+    
+    # Create labels with amounts
+    labels = [f"{cat}\n{amt:.0f}" for cat, amt in zip(categories, amounts)]
+    
+    # Color palette - vibrant and distinct colors
+    colors = [
+        '#FF6B6B',  # Coral Red
+        '#4ECDC4',  # Turquoise
+        '#45B7D1',  # Sky Blue
+        '#96CEB4',  # Sage Green
+        '#FFEAA7',  # Cream Yellow
+        '#DDA0DD',  # Plum
+        '#98D8C8',  # Mint
+        '#F7DC6F',  # Mustard
+        '#BB8FCE',  # Light Purple
+        '#85C1E9',  # Light Blue
+        '#F8B500',  # Gold
+        '#FF8C00',  # Dark Orange
+    ]
+    
+    # Create figure with transparent background
+    fig, ax = plt.subplots(figsize=(10, 8), facecolor='white')
+    
+    # Create pie chart
+    wedges, texts, autotexts = ax.pie(
+        amounts,
+        labels=labels,
+        autopct=lambda pct: f'{pct:.1f}%',
+        colors=colors[:len(categories)],
+        startangle=90,
+        explode=[0.02] * len(categories),  # Slight separation
+        textprops={'fontsize': 11, 'fontweight': 'bold'},
+        pctdistance=0.75,
+        labeldistance=1.15,
+    )
+    
+    # Style the percentage labels
+    for autotext in autotexts:
+        autotext.set_fontsize(10)
+        autotext.set_fontweight('bold')
+        autotext.set_color('white')
+    
+    # Equal aspect ratio ensures circular pie
+    ax.axis('equal')
+    
+    # Title
+    ax.set_title(f'Expenses by Category\nTotal: {total:.0f}', fontsize=14, fontweight='bold', pad=20)
+    
+    # Save to BytesIO buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', 
+                facecolor='white', edgecolor='none')
+    buf.seek(0)
+    plt.close(fig)
+    
+    return buf
+
+
+async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /stat command - show statistics for a period."""
+    chat_id = update.effective_chat.id
+    expenses_file = get_expenses_file(chat_id)
+    
+    if not expenses_file.exists():
+        await update.message.reply_text(
+            "📊 No expenses recorded yet.\n\n"
+            "Use /expense to add your first expense!"
+        )
+        return ConversationHandler.END
+    
+    # Get available periods
+    periods = get_periods(expenses_file)
+    
+    if not periods:
+        await update.message.reply_text(
+            "📊 No expenses found in the records.\n\n"
+            "Use /expense to add expenses."
+        )
+        return ConversationHandler.END
+    
+    # Store periods in context for later use
+    context.user_data["stat_periods"] = periods
+    
+    # Create inline keyboard with periods
+    keyboard = []
+    for i, (name, start, end) in enumerate(periods):
+        button_text = f"📅 {name}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"period_{i}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📊 Choose a period to view statistics:",
+        reply_markup=reply_markup
+    )
+    return SELECTING_PERIOD
+
+
+async def period_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle period selection and show statistics."""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = update.effective_chat.id
+    
+    # Extract period index from callback data
+    period_idx = int(query.data.replace("period_", ""))
+    periods = context.user_data.get("stat_periods", [])
+    
+    if period_idx >= len(periods):
+        await query.edit_message_text("❌ Invalid period selection.")
+        return ConversationHandler.END
+    
+    period_name, start_date, end_date = periods[period_idx]
+    expenses_file = get_expenses_file(chat_id)
+    
+    # Get statistics for the period
+    stats = get_stat_for_period(expenses_file, start_date, end_date)
+    
+    # Check if there are any expenses
+    if stats["total"] == 0:
+        await query.edit_message_text(
+            f"📊 Statistics for {period_name}\n\n"
+            f"No expenses found in this period."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    # Format the text message
+    message_lines = [
+        f"📊 *Statistics for {period_name}*",
+        f"📅 Period: {start_date} — {end_date}",
+        "",
+        f"💰 *Total spend: {stats['total']:.2f}*",
+        "",
+        "👥 *Spend by user:*",
+    ]
+    
+    # Add user breakdown
+    for user, amount in sorted(stats["by_user"].items(), key=lambda x: -x[1]):
+        percentage = (amount / stats["total"]) * 100
+        message_lines.append(f"  • {user}: {amount:.2f} ({percentage:.1f}%)")
+    
+    message_text = "\n".join(message_lines)
+    
+    # Edit the original message with text statistics
+    await query.edit_message_text(message_text, parse_mode="Markdown")
+    
+    # Generate and send pie chart
+    if stats["by_category"]:
+        pie_chart = generate_pie_chart(stats["by_category"])
+        if pie_chart:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=pie_chart,
+                caption=f"📊 Expenses by category for {period_name}"
+            )
+    
+    # Clear user data
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -357,6 +590,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Commands:*\n"
         "/start - Set up categories for the group\n"
         "/expense - Add a new expense\n"
+        "/stat - View spending statistics and charts\n"
         "/setcategories - Change expense categories\n"
         "/cancel - Cancel current operation\n"
         "/help - Show this help message\n\n"
@@ -364,7 +598,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "1. Add the bot to your group\n"
         "2. Use /start to set up expense categories\n"
         "3. Use /expense to add expenses\n"
-        "4. Each group has its own categories and expense file",
+        "4. Use /stat to view statistics by period\n"
+        "5. Each group has its own categories and expense file",
         parse_mode="Markdown"
     )
 
@@ -419,9 +654,23 @@ def main() -> None:
         per_user=True,  # Track each user's expense separately
     )
     
+    # Statistics conversation handler
+    stat_handler = ConversationHandler(
+        entry_points=[CommandHandler("stat", stat_command)],
+        states={
+            SELECTING_PERIOD: [
+                CallbackQueryHandler(period_selected, pattern="^period_"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=False,
+        per_user=True,
+    )
+    
     # Add handlers
     application.add_handler(setup_handler)
     application.add_handler(expense_handler)
+    application.add_handler(stat_handler)
     application.add_handler(CommandHandler("help", help_command))
     
     # Start the bot
