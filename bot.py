@@ -89,6 +89,60 @@ def save_expense(chat_id: int, user: str, category: str, price: float, comment: 
         writer.writerow([date, user, category, price, comment])
 
 
+def get_periods(csv_file: str | Path) -> list[tuple[str, str, str]]:
+    """
+    Get period information from a CSV file with a Date column.
+    
+    Returns a list of tuples containing:
+    - 3 last months: (month_name, first_date, last_date)
+    - Last year: (year_number, first_date, last_date)
+    - All period: ("All period", earliest_date, latest_date)
+    """
+    import calendar
+    
+    # Read dates from CSV
+    dates = []
+    with open(csv_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            date_str = row["Date"].split()[0]  # Get only date part (YYYY-MM-DD)
+            dates.append(datetime.strptime(date_str, "%Y-%m-%d").date())
+    
+    if not dates:
+        return []
+    
+    # Sort dates
+    dates.sort()
+    
+    result = []
+    
+    # Get unique months (year, month) sorted descending
+    unique_months = sorted(set((d.year, d.month) for d in dates), reverse=True)
+    
+    # 3 last months
+    for year, month in unique_months[:3]:
+        month_name = calendar.month_name[month]
+        first_day = f"{year}-{month:02d}-01"
+        last_day_num = calendar.monthrange(year, month)[1]
+        last_day = f"{year}-{month:02d}-{last_day_num:02d}"
+        result.append((month_name, first_day, last_day))
+    
+    # Last year
+    unique_years = sorted(set(d.year for d in dates), reverse=True)
+    if unique_years:
+        last_year = unique_years[0]
+        first_day_year = f"{last_year}-01-01"
+        last_day_year = f"{last_year}-12-31"
+        result.append((str(last_year), first_day_year, last_day_year))
+    
+    # All period
+    earliest = min(dates)
+    latest = max(dates)
+    result.append(("All period", earliest.strftime("%Y-%m-%d"), latest.strftime("%Y-%m-%d")))
+    
+    return result
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /start command - ask for categories if not set."""
     chat_id = update.effective_chat.id
