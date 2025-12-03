@@ -57,12 +57,12 @@ SELECTING_PERIOD = 4
 
 def get_categories_file(chat_id: int) -> Path:
     """Get path to categories file for a specific chat."""
-    return CATEGORIES_DIR / f"{chat_id}.json"
+    return CATEGORIES_DIR / f"categories_{chat_id}.json"
 
 
 def get_expenses_file(chat_id: int) -> Path:
     """Get path to expenses CSV file for a specific chat."""
-    return EXPENSES_DIR / f"{chat_id}.csv"
+    return EXPENSES_DIR / f"expenses_{chat_id}.csv"
 
 
 def load_categories(chat_id: int) -> list[str] | None:
