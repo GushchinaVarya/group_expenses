@@ -41,11 +41,13 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 CATEGORIES_DIR = DATA_DIR / "categories"
 EXPENSES_DIR = DATA_DIR / "expenses"
+EXPENSES_TMP_DIR = DATA_DIR / "expenses_tmp"
 
 # Ensure directories exist
 DATA_DIR.mkdir(exist_ok=True)
 CATEGORIES_DIR.mkdir(exist_ok=True)
 EXPENSES_DIR.mkdir(exist_ok=True)
+EXPENSES_TMP_DIR.mkdir(exist_ok=True)
 
 # Conversation states
 WAITING_FOR_CATEGORIES = 0
@@ -53,6 +55,7 @@ SELECTING_CATEGORY = 1
 ENTERING_PRICE = 2
 ENTERING_COMMENT = 3
 SELECTING_PERIOD = 4
+SELECTING_PERIOD_FOR_FILE = 5
 
 
 def get_categories_file(chat_id: int) -> Path:
@@ -140,6 +143,50 @@ def get_stat_for_period(csv_file: str | Path, start: str, end: str) -> dict:
         "by_category": by_category,
         "by_user": by_user,
     }
+
+
+def get_csv_for_period(csv_file: str | Path, start: str, end: str) -> Path:
+    """
+    Create a filtered CSV file containing only rows within the specified period.
+    
+    Args:
+        csv_file: Path to CSV file with columns Date,User,Category,Price,Comment
+        start: Start date in format YYYY-MM-DD
+        end: End date in format YYYY-MM-DD
+    
+    Returns:
+        Path to the created CSV file in data/expenses_tmp/
+    """
+    csv_file = Path(csv_file)
+    start_date = datetime.strptime(start, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    
+    # Create output filename: <original_name>_tmp<start><end>.csv
+    original_name = csv_file.stem  # filename without extension
+    output_filename = f"{original_name}_tmp{start}{end}.csv"
+    output_path = EXPENSES_TMP_DIR / output_filename
+    
+    # Read and filter rows
+    filtered_rows = []
+    with open(csv_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        for row in reader:
+            # Parse date (only date part, ignore time)
+            date_str = row["Date"].split()[0]
+            row_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            
+            # Check if within period
+            if start_date <= row_date <= end_date:
+                filtered_rows.append(row)
+    
+    # Write filtered rows to new CSV file
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(filtered_rows)
+    
+    return output_path
 
 
 def get_periods(csv_file: str | Path) -> list[tuple[str, str, str]]:
@@ -376,6 +423,89 @@ async def period_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /getfile command - export expenses CSV for a period."""
+    chat_id = update.effective_chat.id
+    expenses_file = get_expenses_file(chat_id)
+    
+    if not expenses_file.exists():
+        await update.message.reply_text(
+            "📁 No expenses recorded yet.\n\n"
+            "Use /expense to add your first expense!"
+        )
+        return ConversationHandler.END
+    
+    # Get available periods
+    periods = get_periods(expenses_file)
+    
+    if not periods:
+        await update.message.reply_text(
+            "📁 No expenses found in the records.\n\n"
+            "Use /expense to add expenses."
+        )
+        return ConversationHandler.END
+    
+    # Store periods in context for later use
+    context.user_data["file_periods"] = periods
+    
+    # Create inline keyboard with periods
+    keyboard = []
+    for i, (name, start, end) in enumerate(periods):
+        button_text = f"📅 {name}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"fileperiod_{i}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📁 Choose a period to export expenses:",
+        reply_markup=reply_markup
+    )
+    return SELECTING_PERIOD_FOR_FILE
+
+
+async def file_period_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle period selection and send CSV file."""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = update.effective_chat.id
+    
+    # Extract period index from callback data
+    period_idx = int(query.data.replace("fileperiod_", ""))
+    periods = context.user_data.get("file_periods", [])
+    
+    if period_idx >= len(periods):
+        await query.edit_message_text("❌ Invalid period selection.")
+        return ConversationHandler.END
+    
+    period_name, start_date, end_date = periods[period_idx]
+    expenses_file = get_expenses_file(chat_id)
+    
+    # Create CSV file for the period
+    csv_file_path = get_csv_for_period(expenses_file, start_date, end_date)
+    
+    # Edit the original message to show selection
+    await query.edit_message_text(f"📅 Selected period: {period_name}")
+    
+    # Send the CSV file
+    try:
+        with open(csv_file_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=f"expenses_{period_name.replace(' ', '_')}_{start_date}_{end_date}.csv",
+                caption=f"📁 Here is the file with all of your expenses for the period {period_name} ({start_date} — {end_date})"
+            )
+    finally:
+        # Delete the temporary CSV file after sending
+        if csv_file_path.exists():
+            csv_file_path.unlink()
+    
+    # Clear user data
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /start command - ask for categories if not set."""
     chat_id = update.effective_chat.id
@@ -591,6 +721,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - Set up categories for the group\n"
         "/expense - Add a new expense\n"
         "/stat - View spending statistics and charts\n"
+        "/getfile - Export expenses as CSV file\n"
         "/setcategories - Change expense categories\n"
         "/cancel - Cancel current operation\n"
         "/help - Show this help message\n\n"
@@ -599,7 +730,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "2. Use /start to set up expense categories\n"
         "3. Use /expense to add expenses\n"
         "4. Use /stat to view statistics by period\n"
-        "5. Each group has its own categories and expense file",
+        "5. Use /getfile to export expenses as CSV\n"
+        "6. Each group has its own categories and expense file",
         parse_mode="Markdown"
     )
 
@@ -667,10 +799,24 @@ def main() -> None:
         per_user=True,
     )
     
+    # Get file conversation handler
+    getfile_handler = ConversationHandler(
+        entry_points=[CommandHandler("getfile", getfile_command)],
+        states={
+            SELECTING_PERIOD_FOR_FILE: [
+                CallbackQueryHandler(file_period_selected, pattern="^fileperiod_"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=False,
+        per_user=True,
+    )
+    
     # Add handlers
     application.add_handler(setup_handler)
     application.add_handler(expense_handler)
     application.add_handler(stat_handler)
+    application.add_handler(getfile_handler)
     application.add_handler(CommandHandler("help", help_command))
     
     # Start the bot
