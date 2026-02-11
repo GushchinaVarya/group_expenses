@@ -56,6 +56,7 @@ ENTERING_PRICE = 2
 ENTERING_COMMENT = 3
 SELECTING_PERIOD = 4
 SELECTING_PERIOD_FOR_FILE = 5
+SETTLEMENT_WAITING_FOR_USERS = 6
 
 
 def get_categories_file(chat_id: int) -> Path:
@@ -143,6 +144,213 @@ def get_stat_for_period(csv_file: str | Path, start: str, end: str) -> dict:
         "by_category": by_category,
         "by_user": by_user,
     }
+
+
+def get_settlement(csv_file: str | Path, usernames: list[str]) -> dict:
+    """
+    Calculate settlement between selected users so that everyone spends the same amount.
+    
+    Args:
+        csv_file: Path to CSV file with columns Date,User,Category,Price,Comment
+        usernames: List of users who want to settle
+    
+    Returns:
+        Dictionary with:
+        - spent: Dict of user -> total spent
+        - average: Target equal spend per user
+        - balances: Dict of user -> balance ( >0 means should receive, <0 means should pay )
+        - transactions: List of transfers:
+            [{"from": user_who_pays, "to": user_who_receives, "amount": float}, ...]
+    """
+    usernames_set = set(usernames)
+    spent: dict[str, float] = {u: 0.0 for u in usernames}
+
+    # Sum spending for each selected user
+    with open(csv_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            user = row.get("User")
+            if user in usernames_set:
+                price_str = (row.get("Price") or "").strip()
+                if not price_str:
+                    continue
+                try:
+                    amount = float(price_str)
+                except ValueError:
+                    continue
+                spent[user] += amount
+
+    # Compute average and balances
+    n = len(usernames)
+    total_spent = sum(spent.values())
+    average = total_spent / n if n > 0 else 0.0
+
+    balances: dict[str, float] = {
+        u: round(spent[u] - average, 2) for u in usernames
+    }
+
+    # Split into debtors (<0) and creditors (>0)
+    creditors: list[list[object]] = []
+    debtors: list[list[object]] = []
+    for user, bal in balances.items():
+        if bal > 0:
+            creditors.append([user, bal])  # [name, positive_balance]
+        elif bal < 0:
+            debtors.append([user, bal])    # [name, negative_balance]
+
+    # Greedy settlement: match biggest creditor with biggest debtor
+    transactions: list[dict] = []
+
+    creditors.sort(key=lambda x: x[1], reverse=True)  # largest positive first
+    debtors.sort(key=lambda x: x[1])                  # most negative first
+
+    i, j = 0, 0
+    while i < len(creditors) and j < len(debtors):
+        cred_user, cred_amount = creditors[i]
+        debt_user, debt_amount = debtors[j]  # negative
+
+        transfer = min(cred_amount, -debt_amount)
+        transfer = round(transfer, 2)
+
+        if transfer > 0:
+            transactions.append({
+                "from": debt_user,
+                "to": cred_user,
+                "amount": transfer,
+            })
+
+        # Update balances for this step
+        creditors[i][1] = round(cred_amount - transfer, 2)
+        debtors[j][1] = round(debt_amount + transfer, 2)
+
+        # Move pointers when someone is settled (close enough to zero)
+        if abs(creditors[i][1]) < 0.01:
+            i += 1
+        if abs(debtors[j][1]) < 0.01:
+            j += 1
+
+    return {
+        "spent": spent,
+        "average": round(average, 2),
+        "balances": balances,
+        "transactions": transactions,
+    }
+
+
+async def settle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handle /settle command - ask which users will take part in settlement.
+    """
+    chat_id = update.effective_chat.id
+    expenses_file = get_expenses_file(chat_id)
+
+    if not expenses_file.exists():
+        await update.message.reply_text(
+            "🤝 No expenses recorded yet.\n\n"
+            "Use /expense to add your first expense before settling."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "🤝 Let's settle up!\n\n"
+        "Send the usernames that will take part in the settlement, separated by commas or spaces.\n"
+        "You can include or omit the @, for example:\n"
+        "@alice, @bob charlie"
+    )
+    return SETTLEMENT_WAITING_FOR_USERS
+
+
+async def receive_settlement_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Receive list of usernames for settlement and send optimal settlement algorithm.
+    """
+    chat_id = update.effective_chat.id
+    expenses_file = get_expenses_file(chat_id)
+
+    if not expenses_file.exists():
+        await update.message.reply_text(
+            "🤝 No expenses recorded yet.\n\n"
+            "Use /expense to add your first expense before settling."
+        )
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    # Split by commas and whitespace, strip optional leading '@'
+    raw_tokens = text.replace(",", " ").split()
+    usernames: list[str] = []
+    for token in raw_tokens:
+        name = token.strip()
+        if not name:
+            continue
+        if name.startswith("@"):
+            name = name[1:]
+        if not name:
+            continue
+        if name not in usernames:
+            usernames.append(name)
+
+    if not usernames:
+        await update.message.reply_text(
+            "❌ I didn't find any usernames.\n\n"
+            "Please send usernames separated by commas or spaces, for example:\n"
+            "@alice, @bob charlie"
+        )
+        return SETTLEMENT_WAITING_FOR_USERS
+
+    try:
+        result = get_settlement(expenses_file, usernames)
+    except Exception as e:
+        logger.exception("Error while calculating settlement: %s", e)
+        await update.message.reply_text(
+            "⚠️ Something went wrong while calculating the settlement. "
+            "Please try again later."
+        )
+        return ConversationHandler.END
+
+    spent: dict[str, float] = result.get("spent", {})
+    average: float = result.get("average", 0.0)
+    balances: dict[str, float] = result.get("balances", {})
+    transactions: list[dict] = result.get("transactions", [])
+
+    total_spent = sum(spent.values())
+    if total_spent == 0 or not transactions:
+        await update.message.reply_text(
+            "🤝 No settlement needed for the selected users.\n\n"
+            "Either there are no expenses for these users or everyone already spent equally."
+        )
+        return ConversationHandler.END
+
+    lines: list[str] = []
+    lines.append("🤝 *Settlement summary*")
+    lines.append("")
+    lines.append(f"👥 Users: {', '.join(usernames)}")
+    lines.append(f"💰 Total spent: {total_spent:.2f}")
+    lines.append(f"🎯 Target per person: {average:.2f}")
+    lines.append("")
+    lines.append("📊 *Balances:*")
+    for user in usernames:
+        user_spent = spent.get(user, 0.0)
+        bal = balances.get(user, 0.0)
+        if bal > 0.01:
+            status = "should receive"
+        elif bal < -0.01:
+            status = "should pay"
+        else:
+            status = "is settled"
+        lines.append(f"  • {user}: spent {user_spent:.2f}, balance {bal:+.2f} ({status})")
+
+    lines.append("")
+    lines.append("📎 *Optimal settlement transactions:*")
+    for tx in transactions:
+        from_user = tx.get("from")
+        to_user = tx.get("to")
+        amount = tx.get("amount", 0.0)
+        lines.append(f"  • {from_user} → {to_user}: {amount:.2f}")
+
+    message_text = "\n".join(lines)
+    await update.message.reply_text(message_text, parse_mode="Markdown")
+
+    return ConversationHandler.END
 
 
 def get_csv_for_period(csv_file: str | Path, start: str, end: str) -> Path:
@@ -652,7 +860,8 @@ async def receive_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Process the comment entered by user and save expense."""
     chat_id = update.effective_chat.id
     user = update.effective_user
-    user_name = user.full_name or user.username or str(user.id)
+    #user_name = user.full_name or user.username or str(user.id)
+    user_name = user.username or user.name or str(user.id)
     
     comment = update.message.text.strip()
     
@@ -681,7 +890,8 @@ async def skip_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     """Skip comment and save expense."""
     chat_id = update.effective_chat.id
     user = update.effective_user
-    user_name = user.full_name or user.username or str(user.id)
+    #user_name = user.full_name or user.username or str(user.id)
+    user_name = user.username or user.name or str(user.id)
     
     # Get saved data
     category = context.user_data.get("expense_category", "Unknown")
@@ -722,6 +932,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/expense - Add a new expense\n"
         "/stat - View spending statistics and charts\n"
         "/getfile - Export expenses as CSV file\n"
+        "/settle - Calculate optimal settlement between users\n"
         "/setcategories - Change expense categories\n"
         "/cancel - Cancel current operation\n"
         "/help - Show this help message\n\n"
@@ -811,12 +1022,26 @@ def main() -> None:
         per_chat=False,
         per_user=True,
     )
+
+    # Settlement conversation handler
+    settle_handler = ConversationHandler(
+        entry_points=[CommandHandler("settle", settle_command)],
+        states={
+            SETTLEMENT_WAITING_FOR_USERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_settlement_users),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=False,
+        per_user=True,
+    )
     
     # Add handlers
     application.add_handler(setup_handler)
     application.add_handler(expense_handler)
     application.add_handler(stat_handler)
     application.add_handler(getfile_handler)
+    application.add_handler(settle_handler)
     application.add_handler(CommandHandler("help", help_command))
     
     # Start the bot
