@@ -348,7 +348,8 @@ async def receive_settlement_users(update: Update, context: ContextTypes.DEFAULT
         lines.append(f"  • {from_user} → {to_user}: {amount:.2f}")
 
     message_text = "\n".join(lines)
-    await update.message.reply_text(message_text, parse_mode="Markdown")
+    # Use plain text to avoid markdown parsing issues with usernames
+    await update.message.reply_text(message_text)
 
     return ConversationHandler.END
 
